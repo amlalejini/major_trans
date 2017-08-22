@@ -1,3 +1,11 @@
+// TODO:
+//  [ ] Setup events.
+//
+// Ancestral Program:
+//  fn-0 00000000:
+//    Nop
+//    Nop
+//
 
 #include <string>
 #include <functional>
@@ -15,14 +23,11 @@
 
 #include "PABBConfig.h"
 
-// TODO:
-//  [ ] Setup events.
-//  [ ] Convert experiment to operate in a class (makes lambdas for instructions/event handlers easier).
-
 using hardware_t = emp::EventDrivenGP;
 using state_t = emp::EventDrivenGP::State;
 using affinity_t = emp::BitSet<8>;
 using program_t = emp::EventDrivenGP::Program;
+using function_t = emp::EventDrivenGP::Function;
 using inst_t = typename::emp::EventDrivenGP::inst_t;
 using inst_lib_t = typename::emp::EventDrivenGP::inst_lib_t;
 using event_t = typename::emp::EventDrivenGP::event_t;
@@ -137,7 +142,8 @@ public:
     inst_lib->AddInst("Pull", hardware_t::Inst_Pull, 2, "Shared memory Arg1 => Shared memory Arg2.");
     inst_lib->AddInst("Nop", hardware_t::Inst_Nop, 0, "No operation.");
     // Custom instructions:
-    inst_lib->AddInst("CopyInst", Inst_CopyInst, 0, "Simulates self-copying of instruction.");
+    // inst_lib->AddInst("CopyInst", Inst_CopyInst, 0, "Simulates self-copying of instruction.");
+    inst_lib->AddInst("Random", Inst_Random, 2, "Local memory: Arg2 => RandomUInt([0:(size_t)Arg1))");
     inst_lib->AddInst("Repro", Inst_Repro, 0, "Triggers reproduction if able.");
     inst_lib->AddInst("ReproRdy", Inst_ReproRdy, 1, "Local memory Arg1 => Ready to repro?");
     inst_lib->AddInst("Export0", Inst_Export0, 0, "Export product ID 0.");
@@ -160,8 +166,27 @@ public:
 
     // Setup the world.
     world = emp::NewPtr<world_t>(random);
+    world->SetGrid(GRID_WIDTH, GRID_HEIGHT);
 
     // Setup the environment.
+    for (size_t i = 0; i < env_states.size(); ++i)
+      env_states[i] = random->GetUInt(0, NUM_ENV_STATES);
+
+    // Initialize the population with single ancestor.
+    // TODO: read ancestor from file
+    program_t prog(inst_lib);
+    prog.PushFunction(function_t(affinity_table[0]));
+    for (size_t i = 0; i < 9; ++i) prog.PushInst("Nop");
+    prog.PushInst("ReproRdy", 0);
+    prog.PushInst("if", 0);
+    prog.PushInst("SetMem", 0, 4);
+    prog.PushInst("Random", 0);
+    prog.PushInst("RotDir", 0);
+    prog.PushInst("Repro");
+    prog.PushInst("Close");
+
+    EventDrivenOrg ancestor;
+
 
 
   }
@@ -177,9 +202,14 @@ public:
     return (size_t) (emp::Mod(x, (int) GRID_WIDTH) + emp::Mod(y, (int) GRID_HEIGHT) * (int)GRID_WIDTH);
   }
 
-  // Instructions:
+  // ============== Instructions: ==============
   static void Inst_CopyInst(emp::EventDrivenGP & hw, const inst_t inst) {
     hw.SetTrait(TRAIT_ID__COPY_CNT, hw.GetTrait(TRAIT_ID__COPY_CNT) + 1);
+  }
+
+  static void Inst_Random(emp::EventDrivenGP & hw, const inst_t inst) {
+    state_t & state = *hw.GetCurState();
+    state.SetLocal(inst.args[1], hw.GetRandom().GetUInt(0, (uint32_t)state.AccessLocal(inst.args[0])));
   }
 
   // @amlalejini - TODO
