@@ -26,6 +26,7 @@
 using hardware_t = emp::EventDrivenGP;
 using state_t = emp::EventDrivenGP::State;
 using affinity_t = emp::BitSet<8>;
+using memory_t = typename emp::EventDrivenGP::memory_t;
 using program_t = emp::EventDrivenGP::Program;
 using function_t = emp::EventDrivenGP::Function;
 using inst_t = typename::emp::EventDrivenGP::inst_t;
@@ -43,15 +44,21 @@ public:
   using org_t = EventDrivenOrg;
   using world_t = emp::World<org_t>;
 
+  struct Loc {
+    size_t x;
+    size_t y;
+    Loc(size_t _x = 0, size_t _y = 0) : x(_x), y(_y) { ; }
+  };
+
 protected:
   // Constant variables:
   static constexpr size_t TRAIT_ID__X_LOC = 0;
-  static constexpr size_t TRAIT_ID__Y_LOC = 0;
-  static constexpr size_t TRAIT_ID__DIR = 0;
-  static constexpr size_t TRAIT_ID__RES = 0;
-  static constexpr size_t TRAIT_ID__LAST_EXPORT = 0;
-  static constexpr size_t TRAIT_ID__COPY_CNT = 0;
-  static constexpr size_t TRAIT_ID__MSG_DIR = 0;
+  static constexpr size_t TRAIT_ID__Y_LOC = 1;
+  static constexpr size_t TRAIT_ID__DIR = 2;
+  static constexpr size_t TRAIT_ID__RES = 3;
+  static constexpr size_t TRAIT_ID__LAST_EXPORT = 4;
+  static constexpr size_t TRAIT_ID__COPY_CNT = 5;
+  static constexpr size_t TRAIT_ID__MSG_DIR = 6;
 
   static constexpr size_t NUM_NEIGHBORS = 4;
   static constexpr size_t NUM_ENV_STATES = 3;
@@ -61,7 +68,7 @@ protected:
   size_t GRID_WIDTH;
   size_t GRID_HEIGHT;
   size_t GRID_SIZE;
-  size_t GENERATIONS;
+  size_t UPDATES;
 
   MajorTransConfig config;
   emp::Ptr<emp::Random> random;
@@ -75,11 +82,14 @@ protected:
 
   emp::Ptr<world_t> world;
 
+  emp::vector<size_t> schedule;
+  emp::vector<size_t> schedule_queue;
+
 public:
   PABB_Ancestral(int argc, char* argv[], const std::string & _config_fname)
-    : RAND_SEED(0), GRID_WIDTH(0), GRID_HEIGHT(0), GRID_SIZE(0), GENERATIONS(0),
+    : RAND_SEED(0), GRID_WIDTH(0), GRID_HEIGHT(0), GRID_SIZE(0), UPDATES(0),
       config(), random(), affinity_table(256), env_state_affs(), env_states(),
-      inst_lib(), event_lib(), world() {
+      inst_lib(), event_lib(), world(), schedule(), schedule_queue() {
 
     // Read configs.
     config.Read(_config_fname);
@@ -98,7 +108,7 @@ public:
     GRID_WIDTH = config.GRID_WIDTH();
     GRID_HEIGHT = config.GRID_HEIGHT();
     GRID_SIZE = GRID_WIDTH * GRID_HEIGHT;
-    GENERATIONS = config.GENERATIONS();
+    UPDATES = config.UPDATES();
 
     // Create random number generator.
     random = emp::NewPtr<emp::Random>(RAND_SEED);
@@ -166,7 +176,9 @@ public:
 
     // Setup the world.
     world = emp::NewPtr<world_t>(random);
-    world->SetGrid(GRID_WIDTH, GRID_HEIGHT);
+    world->SetGrid(GRID_WIDTH, GRID_HEIGHT, false);
+    world->SetPrintFun([](org_t & hw, std::ostream & ostream){ hw.PrintState(ostream); });
+    world->OnOrgPlacement([this](size_t id) { this->OnOrgPlacement(id); });
 
     // Setup the environment.
     for (size_t i = 0; i < env_states.size(); ++i)
@@ -178,7 +190,7 @@ public:
     prog.PushFunction(function_t(affinity_table[0]));
     for (size_t i = 0; i < 9; ++i) prog.PushInst("Nop");
     prog.PushInst("ReproRdy", 0);
-    prog.PushInst("if", 0);
+    prog.PushInst("If", 0);
     prog.PushInst("SetMem", 0, 4);
     prog.PushInst("Random", 0);
     prog.PushInst("RotDir", 0);
@@ -186,9 +198,13 @@ public:
     prog.PushInst("Close");
 
     EventDrivenOrg ancestor;
+    ancestor.SetProgram(prog);
 
-
-
+    // Inject ancestor in the middle of the world.
+    size_t mid_x = GRID_WIDTH / 2;
+    size_t mid_y = GRID_HEIGHT / 2;
+    world->InjectAt(ancestor, GetID(mid_x, mid_y));
+    schedule.emplace_back(GetID(mid_x, mid_y));
   }
 
   ~PABB_Ancestral() {
@@ -199,7 +215,52 @@ public:
   }
 
   size_t GetEnvState(size_t x, size_t y) {
-    return (size_t) (emp::Mod(x, (int) GRID_WIDTH) + emp::Mod(y, (int) GRID_HEIGHT) * (int)GRID_WIDTH);
+    return env_states[GetID(x, y)];
+  }
+
+  size_t GetID(size_t x, size_t y) {
+    return (size_t)(emp::Mod((int)x, (int)GRID_WIDTH) + emp::Mod((int)y, (int)GRID_HEIGHT) * (int)GRID_WIDTH);
+  }
+
+  Loc GetPos(size_t id) { return Loc(emp::Mod((int)id, (int)GRID_WIDTH), id / GRID_WIDTH); }
+
+  // ============== Running the experiment. ==============
+  void Run() {
+    // Run Evolution.
+
+    for (size_t ud = 0; ud < UPDATES; ++ud) {
+      std::cout << "===============================" << std::endl;
+      std::cout << "Update: " << ud << std::endl;
+
+      // Randomize schedule.
+      Shuffle(*random, schedule);
+
+      // Give out CPU cycles to everyone on the schedule.
+      for (size_t i = 0; i < schedule.size(); ++i) {
+        size_t id = schedule[i];
+        std::cout << "  Running... " << id << std::endl;
+        world->GetOrg(id).PrintState();
+        world->ProcessID(id, 1); // Call Process(num_inst = 1)
+      }
+
+      // Update the schedule (add positions that were previously empty).
+      for (size_t i = 0; i < schedule_queue.size(); ++i) {
+        schedule.emplace_back(schedule_queue[i]);
+      } schedule_queue.resize(0);
+
+      //world->Print();
+    }
+  }
+
+  // ============== World signal handlers: ==============
+  void OnOrgPlacement(size_t id) {
+    // Configure placed organism.
+    Loc pos = GetPos(id);
+    org_t & org = world->GetOrg(id);
+    std::cout << "Org being placed: " << id << "(" << pos.x << ", " << pos.y << ")"<< std::endl;
+    org.SetTrait(TRAIT_ID__X_LOC, pos.x);
+    org.SetTrait(TRAIT_ID__Y_LOC, pos.y);
+    org.PrintState();
   }
 
   // ============== Instructions: ==============
@@ -208,7 +269,7 @@ public:
   }
 
   static void Inst_Random(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     state.SetLocal(inst.args[1], hw.GetRandom().GetUInt(0, (uint32_t)state.AccessLocal(inst.args[0])));
   }
 
@@ -246,27 +307,27 @@ public:
   }
 
   static void Inst_RotDir(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     hw.SetTrait(TRAIT_ID__DIR, emp::Mod((int)state.AccessLocal(inst.args[0]), NUM_NEIGHBORS));
   }
 
   static void Inst_GetDir(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     state.SetLocal(inst.args[0], hw.GetTrait(TRAIT_ID__DIR));
   }
 
   static void Inst_SendMsgFacing(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     hw.TriggerEvent("Message", inst.affinity, state.output_mem, {"facing"});
   }
 
   static void Inst_SendMsgRandom(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     hw.TriggerEvent("Message", inst.affinity, state.output_mem, {"random"});
   }
 
   static void Inst_SendMsg(emp::EventDrivenGP & hw, const inst_t inst) {
-    state_t & state = *hw.GetCurState();
+    state_t & state = hw.GetCurState();
     hw.SetTrait(TRAIT_ID__MSG_DIR, emp::Mod((int)state.AccessLocal(inst.args[0]), NUM_NEIGHBORS));
     hw.TriggerEvent("Message", inst.affinity, state.output_mem, {"arg"});
   }
@@ -282,5 +343,6 @@ public:
 
 int main(int argc, char* argv[]) {
   PABB_Ancestral experiment(argc, argv, "ancestral__local_env.cfg");
+  experiment.Run();
   return 0;
 }
