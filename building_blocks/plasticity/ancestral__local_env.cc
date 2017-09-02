@@ -1,11 +1,22 @@
 // TODO:
 //  [ ] Setup events.
+//  [ ] Add default event handler to EventDrivenGP
+//  [ ] Save time by giving each hardware_t world_id trait.
 //
 // Ancestral Program:
 //  fn-0 00000000:
 //    Nop
 //    Nop
 //    ...
+
+// Reproduction flow:
+//    - DoReproduction() <-- trigger reproduction.
+//      - DoBirthAt()
+//      - Reset parent here.
+//    - Offspring ready 
+//      - Mutations
+//    - Org Placement
+//      - Reset placed org (offspring)
 
 #include <string>
 #include <functional>
@@ -61,6 +72,7 @@ protected:
   static constexpr size_t TRAIT_ID__RES = 3;          //< Used to store how many resources this agent has collected.
   static constexpr size_t TRAIT_ID__LAST_EXPORT = 4;  //< Used to determine most recent export (-1 if nothing exported).
   static constexpr size_t TRAIT_ID__MSG_DIR = 5;      //< Used to determine direction of message dispatch.
+  static constexpr size_t TRAIT_ID__RES_MOD = 6;      //< Used to determine how many resources should be gained from an export.
 
   static constexpr size_t NUM_NEIGHBORS = 4;
   static constexpr size_t NUM_ENV_STATES = 3;
@@ -79,7 +91,10 @@ protected:
 
   size_t COST_OF_REPRO;
   size_t FAILED_REPRO_PENALTY;
-  size_t RES_PER_UPDATE;
+  double RES_PER_UPDATE;
+  double MAX_MOD;
+  double MIN_MOD;
+  double EXPORT_REWARD;
 
   MajorTransConfig config;
   emp::Ptr<emp::Random> random;
@@ -95,8 +110,6 @@ protected:
 
   emp::vector<size_t> schedule;
   emp::vector<size_t> schedule_queue;
-
-  size_t reward_modifier;
 
 public:
   PABB_Ancestral(int argc, char* argv[], const std::string & _config_fname)
@@ -122,6 +135,10 @@ public:
     GRID_HEIGHT = config.GRID_HEIGHT();
     GRID_SIZE = GRID_WIDTH * GRID_HEIGHT;
     UPDATES = config.UPDATES();
+    MAX_MOD = config.MAX_MOD();
+    MIN_MOD = config.MIN_MOD();
+    RES_PER_UPDATE = config.RESOURCES_PER_UPDATE();
+    EXPORT_REWARD = config.EXPORT_REWARD();
 
     // Create random number generator.
     random = emp::NewPtr<emp::Random>(RAND_SEED);
@@ -166,13 +183,11 @@ public:
     inst_lib->AddInst("Nop", hardware_t::Inst_Nop, 0, "No operation.");
     // Custom instructions:
     inst_lib->AddInst("Random", Inst_Random, 2, "Local memory: Arg2 => RandomUInt([0:(size_t)Arg1))");
-    inst_lib->AddInst("Repro", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Repro(hw, inst); },
-                      0, "Triggers reproduction if able.");
-    inst_lib->AddInst("ReproRdy", [this](hardware_t & hw, const inst_t & inst) { this->Inst_ReproRdy(hw, inst); },
-                      1, "Local memory Arg1 => Ready to repro?");
-    inst_lib->AddInst("Export0", Inst_Export0, 0, "Export product ID 0.");
-    inst_lib->AddInst("Export1", Inst_Export1, 0, "Export product ID 1.");
-    inst_lib->AddInst("Export2", Inst_Export2, 0, "Export product ID 2.");
+    inst_lib->AddInst("Repro", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Repro(hw, inst); }, 0, "Triggers reproduction if able.");
+    inst_lib->AddInst("ReproRdy", [this](hardware_t & hw, const inst_t & inst) { this->Inst_ReproRdy(hw, inst); }, 1, "Local memory Arg1 => Ready to repro?");
+    inst_lib->AddInst("Export0", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Export0(hw, inst); }, 0, "Export product ID 0.");
+    inst_lib->AddInst("Export1", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Export1(hw, inst); }, 0, "Export product ID 1.");
+    inst_lib->AddInst("Export2", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Export2(hw, inst); }, 0, "Export product ID 2.");
     inst_lib->AddInst("RotCW", Inst_RotCW, 0, "Rotate orientation clockwise (90 degrees) once.");
     inst_lib->AddInst("RotCCW", Inst_RotCCW, 0, "Rotate orientation counter-clockwise (90 degrees) once.");
     inst_lib->AddInst("RotDir", Inst_RotDir, 1, "Rotate to face direction specified by Arg1 (Arg1 mod 4)");
@@ -180,15 +195,20 @@ public:
     inst_lib->AddInst("SendMsgFacing", Inst_SendMsgFacing, 0, "Send output memory as message event to faced neighbor.", emp::ScopeType::BASIC, 0, {"affinity"});
     inst_lib->AddInst("SendMsgRandom", Inst_SendMsgRandom, 0, "Send output memory as message event to random neighbor.", emp::ScopeType::BASIC, 0, {"affinity"});
     inst_lib->AddInst("SendMsg", Inst_SendMsg, 1, "Send output memory as message event to neighbor specified by local memory Arg1.", emp::ScopeType::BASIC, 0, {"affinity"});
-    inst_lib->AddInst("BindEnv", Inst_BindEnv, 0, "Bind environment to appropriate function.");
+    inst_lib->AddInst("BindEnv", [this](hardware_t & hw, const inst_t & inst) { this->Inst_BindEnv(hw, inst); }, 0, "Bind environment to appropriate function.");
 
     // Setup the event library.
     event_lib = emp::NewPtr<event_lib_t>(*emp::EventDrivenGP::DefaultEventLib());
+    event_lib->RegisterDispatchFun("Message", [this](hardware_t & hw, const event_t & event){ this->DispatchMessage(hw, event); });
+
+    // Add events
+    // event_lib->AddEvent("Reproduction", [this](){}, "Event for organism reproduction.");
     // TODO: setup events
-    //  [ ] Message dispatcher
-    //  [ ] BindEnv handler [ ] BindEnv dispatcher
-    //  [ ] Export event.
-    //  [ ] Reproduction.
+    //  [x] Message dispatcher
+    //  [x] BindEnv handler [x] BindEnv dispatcher --> Moved event stuff into instruction.
+    //  [x] Export event. --> Simplify into an instruction.
+    //  [ ] Reproduction. --> Simplify to instruction?
+
 
     // Setup the world.
     world = emp::NewPtr<world_t>(random);
@@ -270,6 +290,29 @@ public:
 
   Loc GetPos(size_t id) { return Loc(emp::Mod((int)id, (int)GRID_WIDTH), id / GRID_WIDTH); }
 
+  void DoExport(size_t id, size_t val) {
+    hardware_t & hw = world->GetOrg(id);
+    hw.SetTrait(TRAIT_ID__LAST_EXPORT, 0);
+    double mod = hw.GetTrait(TRAIT_ID__RES_MOD);
+    if (val == env_states[id]) {
+      // Reward & increase modifier.
+      hw.SetTrait(TRAIT_ID__RES, (mod * EXPORT_REWARD) + hw.GetTrait(TRAIT_ID__RES));
+      mod = emp::Min(MAX_MOD, mod * 2.0);
+    } else {
+      // decrease modifier.
+      mod = emp::Max(MIN_MOD, mod / 2.0);
+    }
+    // Update resource modifier.
+    hw.SetTrait(TRAIT_ID__RES_MOD, mod);
+    // Change environment.
+    env_states[id] = random->GetUInt(NUM_ENV_STATES);
+  }
+
+  // DoRepro(source->dest)
+  void DoReproduction(size_t src_id, size_t dest_id) {
+
+  }
+
   void ResetOrg(size_t id) {
     Loc pos = GetPos(id);
     org_t & org = world->GetOrg(id);
@@ -279,6 +322,7 @@ public:
     org.SetTrait(TRAIT_ID__RES, 0);
     org.SetTrait(TRAIT_ID__LAST_EXPORT, -1);
     org.SetTrait(TRAIT_ID__MSG_DIR, -1);
+    org.SetTrait(TRAIT_ID__RES_MOD, 1);
   }
 
   // ============== Running the experiment. ==============
@@ -303,7 +347,6 @@ public:
       for (size_t i = 0; i < schedule_queue.size(); ++i) {
         schedule.emplace_back(schedule_queue[i]);
       } schedule_queue.resize(0);
-
       //world->Print();
     }
   }
@@ -318,6 +361,36 @@ public:
     org.PrintState();
   }
 
+  // ============== Event Dispatchers: ==============
+  /// Event: Message
+  /// Description:
+  ///   * Msg types that need to be dispatched:
+  ///     * send - On a send message event, dispatch to neighbor given by hw.GetTrait(TRAIT_ID__MSG_DIR)
+  ///     * broadcast -- On a broadcast message event, dispatch message to all neighbors.
+  void DispatchMessage(hardware_t & hw, const event_t & event) {
+    const size_t sender_x = (size_t)hw.GetTrait(TRAIT_ID__X_LOC);
+    const size_t sender_y = (size_t)hw.GetTrait(TRAIT_ID__Y_LOC);
+    if (event.HasProperty("send")) {
+      const size_t dir = (size_t)hw.GetTrait(TRAIT_ID__MSG_DIR);
+      // Who is the recipient?
+      const Loc pos = GetFacing(sender_x, sender_y, dir);
+      // Queue up the message.
+      world->GetOrg(GetID(pos.x, pos.y)).QueueEvent(event);
+    } else {
+      const Loc u_pos = GetFacing(sender_x, sender_y, DIR_UP);
+      const Loc d_pos = GetFacing(sender_x, sender_y, DIR_DOWN);
+      const Loc r_pos = GetFacing(sender_x, sender_y, DIR_RIGHT);
+      const Loc l_pos = GetFacing(sender_x, sender_y, DIR_LEFT);
+      // Queue up messages.
+      world->GetOrg(GetID(u_pos.x, u_pos.y)).QueueEvent(event);
+      world->GetOrg(GetID(d_pos.x, d_pos.y)).QueueEvent(event);
+      world->GetOrg(GetID(r_pos.x, r_pos.y)).QueueEvent(event);
+      world->GetOrg(GetID(l_pos.x, l_pos.y)).QueueEvent(event);
+    }
+  }
+
+
+  // ============== Event Handlers: ==============
 
   // ============== Instructions: ==============
   /// Instruction: ReproRdy
@@ -334,7 +407,11 @@ public:
     // If organism has collected sufficient resources, trigger reproduction.
     double res = hw.GetTrait(TRAIT_ID__RES);
     if (res >= COST_OF_REPRO) {
-      hw.TriggerEvent("Reproduction", inst.affinity);
+      const size_t x = hw.GetTrait(TRAIT_ID__X_LOC);
+      const size_t y = hw.GetTrait(TRAIT_ID__Y_LOC);
+      const size_t dir = hw.GetTrait(TRAIT_ID__DIR);
+      const Loc offspring_pos = GetFacing(x, y, dir);
+      DoReproduction(GetID(x, y), GetID(offspring_pos.x, offspring_pos.y));
     } else { // Otherwise, pay cost of failure.
       hw.SetTrait(TRAIT_ID__RES, res - FAILED_REPRO_PENALTY);
     }
@@ -349,23 +426,23 @@ public:
 
   /// Instruction: Export0
   /// Description: Trigger export event, indicating that this is an 'Export0' via the event memory.
-  static void Inst_Export0(emp::EventDrivenGP & hw, const inst_t & inst) {
-    hw.SetTrait(TRAIT_ID__LAST_EXPORT, 0);
-    hw.TriggerEvent("Export", inst.affinity, {{0,1}});
+  void Inst_Export0(emp::EventDrivenGP & hw, const inst_t & inst) {
+    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    DoExport(id, 0);
   }
 
   /// Instruction: Export1
   /// Description: Trigger export event, indicating that this is an 'Export1' via the event memory.
-  static void Inst_Export1(emp::EventDrivenGP & hw, const inst_t & inst) {
-    hw.SetTrait(TRAIT_ID__LAST_EXPORT, 1);
-    hw.TriggerEvent("Export", inst.affinity, {{1,1}});
+  void Inst_Export1(emp::EventDrivenGP & hw, const inst_t & inst) {
+    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    DoExport(id, 1);
   }
 
   /// Instruction: Export2
   /// Description: Trigger export event, indicating that this is an 'Export2' via the event memory.
-  static void Inst_Export2(emp::EventDrivenGP & hw, const inst_t & inst) {
-    hw.SetTrait(TRAIT_ID__LAST_EXPORT, 2);
-    hw.TriggerEvent("Export", inst.affinity, {{2,2}});
+  void Inst_Export2(emp::EventDrivenGP & hw, const inst_t & inst) {
+    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    DoExport(id, 2);
   }
 
   /// Instruction: RotCW
@@ -421,8 +498,10 @@ public:
   /// Instruction: BindEnv
   /// Description: Trigger BindEnv event. The function in hw's program that best matches current
   ///              environment affinity is called.
-  static void Inst_BindEnv(emp::EventDrivenGP & hw, const inst_t & inst) {
-    hw.TriggerEvent("BindEnv");
+  void Inst_BindEnv(emp::EventDrivenGP & hw, const inst_t & inst) {
+    const size_t id = GetID((size_t)hw.GetTrait(TRAIT_ID__X_LOC), (size_t)hw.GetTrait(TRAIT_ID__Y_LOC));
+    const size_t e = env_states[id];
+    hw.SpawnCore(env_state_affs[e], hw.GetMinBindThresh());
   }
 
 };

@@ -11,6 +11,12 @@ EMP_BUILD_CONFIG( MajorTransConfig,
   GROUP(ENVIRONMENT_GROUP, "Environment Settings"),
   VALUE(GRID_WIDTH, size_t, 60, "Width of population grid."),
   VALUE(GRID_HEIGHT, size_t, 60, "Height of population grid."),
+  VALUE(MAX_MOD, double, 1.0, "Maximum allowed resource modifier."),
+  VALUE(MIN_MOD, double, 0.125, "Minimum allowed resource modifier."),
+  VALUE(RESOURCES_PER_UPDATE, double, 1.0, "Maximum allowed resource modifier."),
+  VALUE(EXPORT_REWARD, double, 4.0, "Minimum allowed resource modifier.")
+
+
 )
 
 #endif
