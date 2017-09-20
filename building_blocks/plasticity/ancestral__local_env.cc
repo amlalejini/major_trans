@@ -9,14 +9,6 @@
 //    Nop
 //    ...
 
-// Reproduction flow:
-//    - DoReproduction() <-- trigger reproduction.
-//      - DoBirthAt()
-//      - Reset parent here.
-//    - Offspring ready 
-//      - Mutations
-//    - Org Placement
-//      - Reset placed org (offspring)
 
 #include <string>
 #include <functional>
@@ -66,13 +58,13 @@ public:
 
 protected:
   // Constant variables:
-  static constexpr size_t TRAIT_ID__X_LOC = 0;        //< Agent's Y location.
-  static constexpr size_t TRAIT_ID__Y_LOC = 1;        //< Agent's X location.
-  static constexpr size_t TRAIT_ID__DIR = 2;          //< Used to indicate which direction agent is facing.
-  static constexpr size_t TRAIT_ID__RES = 3;          //< Used to store how many resources this agent has collected.
-  static constexpr size_t TRAIT_ID__LAST_EXPORT = 4;  //< Used to determine most recent export (-1 if nothing exported).
-  static constexpr size_t TRAIT_ID__MSG_DIR = 5;      //< Used to determine direction of message dispatch.
-  static constexpr size_t TRAIT_ID__RES_MOD = 6;      //< Used to determine how many resources should be gained from an export.
+  static constexpr size_t TRAIT_ID__X_LOC = 0;        ///< Agent's Y location.
+  static constexpr size_t TRAIT_ID__Y_LOC = 1;        ///< Agent's X location.
+  static constexpr size_t TRAIT_ID__DIR = 2;          ///< Used to indicate which direction agent is facing.
+  static constexpr size_t TRAIT_ID__RES = 3;          ///< Used to store how many resources this agent has collected.
+  static constexpr size_t TRAIT_ID__LAST_EXPORT = 4;  ///< Used to determine most recent export (-1 if nothing exported).
+  static constexpr size_t TRAIT_ID__MSG_DIR = 5;      ///< Used to determine direction of message dispatch.
+  static constexpr size_t TRAIT_ID__RES_MOD = 6;      ///< Used to determine how many resources should be gained from an export.
 
   static constexpr size_t NUM_NEIGHBORS = 4;
   static constexpr size_t NUM_ENV_STATES = 3;
@@ -82,19 +74,38 @@ protected:
   static constexpr size_t DIR_DOWN = 2;
   static constexpr size_t DIR_RIGHT = 3;
 
-  // Configurable variables:
+  // == Configurable variables: ==
+  // General settings.
   int RAND_SEED;
   size_t GRID_WIDTH;
   size_t GRID_HEIGHT;
   size_t GRID_SIZE;
   size_t UPDATES;
 
-  size_t COST_OF_REPRO;
-  size_t FAILED_REPRO_PENALTY;
+  // Resources & reproduction.
+  double COST_OF_REPRO;
+  double FAILED_REPRO_PENALTY;
   double RES_PER_UPDATE;
   double MAX_MOD;
   double MIN_MOD;
   double EXPORT_REWARD;
+
+  // EventDrivenGP hardware configs.
+  size_t HW_MAX_CORES;
+  size_t HW_MAX_CALL_DEPTH;
+  double HW_MIN_BIND_THRESH;
+
+  // EventDrivenGP program configs.
+  size_t PROG_MAX_FUNC_CNT;
+  size_t PROG_MAX_FUNC_LEN;
+  size_t PROG_MAX_ARG_VAL;
+
+  // Mutation rates.
+  double PER_BIT__AFFINITY_FLIP_RATE;
+  double PER_INST__SUB_RATE;
+  double PER_FUNC__SLIP_RATE;
+  double PER_FUNC__FUNC_DUP_RATE;
+  double PER_FUNC__FUNC_DEL_RATE;
 
   MajorTransConfig config;
   emp::Ptr<emp::Random> random;
@@ -109,13 +120,13 @@ protected:
   emp::Ptr<world_t> world;
 
   emp::vector<size_t> schedule;
-  emp::vector<size_t> schedule_queue;
+  emp::vector<bool> scheduled;
 
 public:
   PABB_Ancestral(int argc, char* argv[], const std::string & _config_fname)
     : RAND_SEED(0), GRID_WIDTH(0), GRID_HEIGHT(0), GRID_SIZE(0), UPDATES(0),
       config(), random(), affinity_table(256), env_state_affs(), env_states(),
-      inst_lib(), event_lib(), world(), schedule(), schedule_queue() {
+      inst_lib(), event_lib(), world(), schedule(), scheduled() {
 
     // Read configs.
     config.Read(_config_fname);
@@ -139,6 +150,19 @@ public:
     MIN_MOD = config.MIN_MOD();
     RES_PER_UPDATE = config.RESOURCES_PER_UPDATE();
     EXPORT_REWARD = config.EXPORT_REWARD();
+    COST_OF_REPRO = config.COST_OF_REPRO();
+    FAILED_REPRO_PENALTY = config.FAILED_REPRO_PENALTY();
+    HW_MAX_CORES = config.HW_MAX_CORES();
+    HW_MAX_CALL_DEPTH = config.HW_MAX_CALL_DEPTH();
+    HW_MIN_BIND_THRESH = config.HW_MIN_BIND_THRESH();
+    PROG_MAX_FUNC_CNT = config.PROG_MAX_FUNC_CNT();
+    PROG_MAX_FUNC_LEN = config.PROG_MAX_FUNC_LEN();
+    PROG_MAX_ARG_VAL = config.PROG_MAX_ARG_VAL();
+    PER_BIT__AFFINITY_FLIP_RATE = config.PER_BIT__AFFINITY_FLIP_RATE();
+    PER_INST__SUB_RATE = config.PER_INST__SUB_RATE();
+    PER_FUNC__SLIP_RATE = config.PER_FUNC__SLIP_RATE();
+    PER_FUNC__FUNC_DUP_RATE = config.PER_FUNC__FUNC_DUP_RATE();
+    PER_FUNC__FUNC_DEL_RATE = config.PER_FUNC__FUNC_DEL_RATE();
 
     // Create random number generator.
     random = emp::NewPtr<emp::Random>(RAND_SEED);
@@ -151,6 +175,9 @@ public:
     // Setup environment state affinities.
     env_state_affs = {affinity_table[0], affinity_table[15], affinity_table[255]};
     env_states.resize(GRID_SIZE);
+
+    // Setup schedule management
+    scheduled.resize(GRID_SIZE, false);
 
     // Setup instruction set.
     inst_lib = emp::NewPtr<inst_lib_t>();
@@ -201,23 +228,15 @@ public:
     event_lib = emp::NewPtr<event_lib_t>(*emp::EventDrivenGP::DefaultEventLib());
     event_lib->RegisterDispatchFun("Message", [this](hardware_t & hw, const event_t & event){ this->DispatchMessage(hw, event); });
 
-    // Add events
-    // event_lib->AddEvent("Reproduction", [this](){}, "Event for organism reproduction.");
-    // TODO: setup events
-    //  [x] Message dispatcher
-    //  [x] BindEnv handler [x] BindEnv dispatcher --> Moved event stuff into instruction.
-    //  [x] Export event. --> Simplify into an instruction.
-    //  [ ] Reproduction. --> Simplify to instruction?
-
-
     // Setup the world.
     world = emp::NewPtr<world_t>(random);
     world->SetGrid(GRID_WIDTH, GRID_HEIGHT, false);
-    world->SetPrintFun([](org_t & hw, std::ostream & ostream){ hw.PrintState(ostream); });
+    world->SetPrintFun([](org_t & hw, std::ostream & ostream) { hw.PrintState(ostream); });
+    world->SetMutFun([this](org_t & hw, emp::Random & rnd) { return this->Mutate(hw, rnd); });
     world->OnOrgPlacement([this](size_t id) { this->OnOrgPlacement(id); });
-    // world->Set
-    // TODO: setup OnOffspringReady, fun_add_birth, fun_get_neighbor(?)
-    // Setup the environment.
+    world->OnOffspringReady([this](org_t & hw) { this->OnOffspringReady(hw); });
+
+    // Setup the environment (randomize).
     for (size_t i = 0; i < env_states.size(); ++i)
       env_states[i] = (size_t)random->GetUInt(0, NUM_ENV_STATES);
 
@@ -236,12 +255,16 @@ public:
 
     EventDrivenOrg ancestor;
     ancestor.SetProgram(prog);
+    ancestor.SetMinBindThresh(HW_MIN_BIND_THRESH);
+    ancestor.SetMaxCores(HW_MAX_CORES);
+    ancestor.SetMaxCallDepth(HW_MAX_CALL_DEPTH);
 
     // Inject ancestor in the middle of the world.
     size_t mid_x = GRID_WIDTH / 2;
     size_t mid_y = GRID_HEIGHT / 2;
-    world->InjectAt(ancestor, GetID(mid_x, mid_y));
-    schedule.emplace_back(GetID(mid_x, mid_y));
+    size_t ancestor_id = GetID(mid_x, mid_y);
+    world->InjectAt(ancestor, ancestor_id);
+    Schedule(ancestor_id);
   }
 
   ~PABB_Ancestral() {
@@ -264,7 +287,7 @@ public:
   size_t GetFacing(size_t id, size_t dir) {
     // Dir:
     //  * 0: up (x, y+1); 1: left (x-1, y); 2: down (x, y-1), 3: right (x+1, y)
-    dir = emp::Mod((int)dir, NUM_NEIGHBORS);
+    dir = (size_t)emp::Mod((int)dir, (int)NUM_NEIGHBORS);
     Loc pos = GetPos(id);
     Loc facing = GetFacing(pos.x, pos.y, dir);
     return GetID(facing.x, facing.y);
@@ -280,19 +303,20 @@ public:
       case DIR_DOWN:  --face_y; break;
       case DIR_RIGHT: ++face_x; break;
     }
-    if (face_y >= GRID_HEIGHT || face_y < 0) face_y = emp::Mod(face_y, GRID_HEIGHT);
-    if (face_x >= GRID_WIDTH || face_x < 0) face_x = emp::Mod(face_x, GRID_WIDTH);
-    return Loc(face_x, face_y);
+    if (face_y >= GRID_HEIGHT || face_y < 0) face_y = emp::Mod(face_y, (int)GRID_HEIGHT);
+    if (face_x >= GRID_WIDTH || face_x < 0) face_x = emp::Mod(face_x, (int)GRID_WIDTH);
+    return Loc((size_t)face_x, (size_t)face_y);
   }
 
   /// Get cell faced by pos in direction dir.
   Loc GetFacing(Loc pos, size_t dir) { return GetFacing(pos.x, pos.y, dir); }
 
-  Loc GetPos(size_t id) { return Loc(emp::Mod((int)id, (int)GRID_WIDTH), id / GRID_WIDTH); }
+  /// Get position in world grid given id.
+  Loc GetPos(size_t id) { return Loc((size_t)emp::Mod((int)id, (int)GRID_WIDTH), id / GRID_WIDTH); }
 
   void DoExport(size_t id, size_t val) {
     hardware_t & hw = world->GetOrg(id);
-    hw.SetTrait(TRAIT_ID__LAST_EXPORT, 0);
+    hw.SetTrait(TRAIT_ID__LAST_EXPORT, val);
     double mod = hw.GetTrait(TRAIT_ID__RES_MOD);
     if (val == env_states[id]) {
       // Reward & increase modifier.
@@ -310,19 +334,119 @@ public:
 
   // DoRepro(source->dest)
   void DoReproduction(size_t src_id, size_t dest_id) {
-
+    std::cout << "Do reproduction: {src_id: " << src_id << ", dest_id: " << dest_id << "}" << std::endl;
+    world->DoBirthAt(world->GetOrg(src_id), dest_id, src_id); // NOTE: This seems exceedingly slow for things like virtual hardware.
+    ResetOrg(src_id); // Reset parent organism.
+    // TODO: Make sure offspring is all good: mutated, and hardware looks same.
+    // Reproduction flow:
+    //    - DoReproduction() <-- trigger reproduction.
+    //      - DoBirthAt()
+    //      - Reset parent here.
+    //    - Offspring ready
+    //      - Mutations
+    //    - Org Placement
+    //      - Reset placed org (offspring)
   }
 
   void ResetOrg(size_t id) {
     Loc pos = GetPos(id);
     org_t & org = world->GetOrg(id);
-    org.SetTrait(TRAIT_ID__X_LOC, pos.x);
+    org.ResetHardware();                    // Reset organism hardware.
+    org.SpawnCore(0, memory_t(), true);     // Spin up main core.
+    org.SetTrait(TRAIT_ID__X_LOC, pos.x);   // Configure traits.
     org.SetTrait(TRAIT_ID__Y_LOC, pos.y);
     org.SetTrait(TRAIT_ID__DIR, 0);
     org.SetTrait(TRAIT_ID__RES, 0);
     org.SetTrait(TRAIT_ID__LAST_EXPORT, -1);
     org.SetTrait(TRAIT_ID__MSG_DIR, -1);
     org.SetTrait(TRAIT_ID__RES_MOD, 1);
+  }
+
+  void Schedule(size_t id) {
+    if (scheduled[id]) return;
+    schedule.emplace_back(id);
+    scheduled[id] = true;
+  }
+
+  /// Mutate organism function.
+  /// Return number of mutation *events* that occur (e.g. function duplication, slip mutation are single events).
+  size_t Mutate(org_t & hw, emp::Random & rnd) {
+    program_t & program = hw.GetProgram();
+    size_t mut_cnt = 0;
+    // Duplicate a function?
+    if (rnd.P(PER_FUNC__FUNC_DUP_RATE) && program.GetSize() < PROG_MAX_FUNC_CNT) {
+      ++mut_cnt;
+      const uint32_t fID = rnd.GetUInt(program.GetSize());
+      program.PushFunction(program[fID]);
+    }
+    // Delete a function?
+    if (rnd.P(PER_FUNC__FUNC_DEL_RATE) && program.GetSize() > 1) {
+      ++mut_cnt;
+      const uint32_t fID = rnd.GetUInt(program.GetSize());
+      program[fID] = program[program.GetSize() - 1];
+      program.program.resize(program.GetSize() - 1);
+    }
+    // For each function...
+    for (size_t fID = 0; fID < program.GetSize(); ++fID) {
+      // Mutate affinity
+      for (size_t i = 0; i < program[fID].GetAffinity().GetSize(); ++i) {
+        affinity_t & aff = program[fID].GetAffinity();
+        if (rnd.P(PER_BIT__AFFINITY_FLIP_RATE)) {
+          ++mut_cnt;
+          aff.Set(i, !aff.Get(i));
+        }
+      }
+      // Slip-mutation?
+      if (rnd.P(PER_FUNC__SLIP_RATE)) {
+        uint32_t begin = rnd.GetUInt(program[fID].GetSize());
+        uint32_t end = rnd.GetUInt(program[fID].GetSize());
+        if (begin < end && ((program[fID].GetSize() + (end - begin)) < PROG_MAX_FUNC_LEN)) {
+          // duplicate begin:end
+          ++mut_cnt;
+          const size_t dup_size = end - begin;
+          const size_t new_size = program[fID].GetSize() + dup_size;
+          org_t::Function new_fun(program[fID].GetAffinity());
+          for (size_t i = 0; i < new_size; ++i) {
+            if (i < end) new_fun.PushInst(program[fID][i]);
+            else new_fun.PushInst(program[fID][i - dup_size]);
+          }
+          program[fID] = new_fun;
+        } else if (begin > end && ((program[fID].GetSize() - (begin - end)) >= 1)) {
+          // delete end:begin
+          ++mut_cnt;
+          org_t::Function new_fun(program[fID].GetAffinity());
+          for (size_t i = 0; i < end; ++i)
+            new_fun.PushInst(program[fID][i]);
+          for (size_t i = begin; i < program[fID].GetSize(); ++i)
+            new_fun.PushInst(program[fID][i]);
+          program[fID] = new_fun;
+        }
+      }
+      // Substitution mutations?
+      for (size_t i = 0; i < program[fID].GetSize(); ++i) {
+        inst_t & inst = program[fID][i];
+        // Mutate affinity (even if it doesn't have one).
+        for (size_t k = 0; k < inst.affinity.GetSize(); ++k) {
+          if (rnd.P(PER_BIT__AFFINITY_FLIP_RATE)) {
+            ++mut_cnt;
+            inst.affinity.Set(k, !inst.affinity.Get(k));
+          }
+        }
+        // Mutate instruction.
+        if (rnd.P(PER_INST__SUB_RATE)) {
+          ++mut_cnt;
+          inst.id = rnd.GetUInt(program.GetInstLib()->GetSize());
+        }
+        // Mutate arguments (even if they aren't relevent to instruction).
+        for (size_t k = 0; k < org_t::MAX_INST_ARGS; ++k) {
+          if (rnd.P(PER_INST__SUB_RATE)) {
+            ++mut_cnt;
+            inst.args[k] = rnd.GetInt(PROG_MAX_ARG_VAL);
+          }
+        }
+      }
+    }
+    return mut_cnt;
   }
 
   // ============== Running the experiment. ==============
@@ -336,31 +460,39 @@ public:
       Shuffle(*random, schedule);
 
       // Give out CPU cycles to everyone on the schedule.
-      for (size_t i = 0; i < schedule.size(); ++i) {
+      // Note: Loop structure relies on overflowing size_t i. When hits -1, will be max size_t.
+      for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
         size_t id = schedule[i];
+        std::cout << "----------------------" << std::endl;
         std::cout << "  Running... " << id << std::endl;
-        // world->GetOrg(id).PrintState();
+        world->GetOrg(id).IncTrait(TRAIT_ID__RES);  // Give out resources.
+        world->GetOrg(id).PrintState();
+        //world->GetOrg(id).SetTrait(TRAIT_ID__RES, )
         world->ProcessID(id, 1); // Call Process(num_inst = 1)
       }
-
-      // Update the schedule (add positions that were previously empty).
-      for (size_t i = 0; i < schedule_queue.size(); ++i) {
-        schedule.emplace_back(schedule_queue[i]);
-      } schedule_queue.resize(0);
-      //world->Print();
+      std::cout << "Press anything to continue..." << std::endl;
+      std::string x;
+      std::cin >> x;
     }
   }
 
   // ============== World signal handlers: ==============
   void OnOrgPlacement(size_t id) {
+    std::cout << "OnOrgPlacement!" << std::endl;
     // Configure placed organism.
     Loc pos = GetPos(id);
     org_t & org = world->GetOrg(id);
     std::cout << "Org being placed: " << id << "(" << pos.x << ", " << pos.y << ")"<< std::endl;
     ResetOrg(id);
+    Schedule(id); // Add to schedule.
     org.PrintState();
   }
 
+  void OnOffspringReady(org_t & hw) {
+    std::cout << "On offspring ready!" << std::endl;
+    // Mutate offspring.
+    world->DoMutationsOrg(hw);
+  }
   // ============== Event Dispatchers: ==============
   /// Event: Message
   /// Description:
@@ -389,9 +521,6 @@ public:
     }
   }
 
-
-  // ============== Event Handlers: ==============
-
   // ============== Instructions: ==============
   /// Instruction: ReproRdy
   /// Description: Local memory Arg1 => Ready to repro?
@@ -407,9 +536,9 @@ public:
     // If organism has collected sufficient resources, trigger reproduction.
     double res = hw.GetTrait(TRAIT_ID__RES);
     if (res >= COST_OF_REPRO) {
-      const size_t x = hw.GetTrait(TRAIT_ID__X_LOC);
-      const size_t y = hw.GetTrait(TRAIT_ID__Y_LOC);
-      const size_t dir = hw.GetTrait(TRAIT_ID__DIR);
+      const size_t x = (size_t)hw.GetTrait(TRAIT_ID__X_LOC);
+      const size_t y = (size_t)hw.GetTrait(TRAIT_ID__Y_LOC);
+      const size_t dir = (size_t)hw.GetTrait(TRAIT_ID__DIR);
       const Loc offspring_pos = GetFacing(x, y, dir);
       DoReproduction(GetID(x, y), GetID(offspring_pos.x, offspring_pos.y));
     } else { // Otherwise, pay cost of failure.
@@ -427,21 +556,21 @@ public:
   /// Instruction: Export0
   /// Description: Trigger export event, indicating that this is an 'Export0' via the event memory.
   void Inst_Export0(emp::EventDrivenGP & hw, const inst_t & inst) {
-    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    const size_t id = GetID((size_t)hw.GetTrait(TRAIT_ID__X_LOC), (size_t)hw.GetTrait(TRAIT_ID__Y_LOC));
     DoExport(id, 0);
   }
 
   /// Instruction: Export1
   /// Description: Trigger export event, indicating that this is an 'Export1' via the event memory.
   void Inst_Export1(emp::EventDrivenGP & hw, const inst_t & inst) {
-    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    const size_t id = GetID((size_t)hw.GetTrait(TRAIT_ID__X_LOC), (size_t)hw.GetTrait(TRAIT_ID__Y_LOC));
     DoExport(id, 1);
   }
 
   /// Instruction: Export2
   /// Description: Trigger export event, indicating that this is an 'Export2' via the event memory.
   void Inst_Export2(emp::EventDrivenGP & hw, const inst_t & inst) {
-    const size_t id = GetID(hw.GetTrait(TRAIT_ID__X_LOC), hw.GetTrait(TRAIT_ID__Y_LOC));
+    const size_t id = GetID((size_t)hw.GetTrait(TRAIT_ID__X_LOC), (size_t)hw.GetTrait(TRAIT_ID__Y_LOC));
     DoExport(id, 2);
   }
 
