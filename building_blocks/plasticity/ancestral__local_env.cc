@@ -40,6 +40,8 @@ using event_lib_t = typename::emp::EventDrivenGP::event_lib_t;
 /// Wrapper around EventDrivenGP to satisfy World.h
 class EventDrivenOrg : public emp::EventDrivenGP {
 public:
+  EventDrivenOrg(emp::Ptr<const inst_lib_t> _ilib, emp::Ptr<const event_lib_t> _elib, emp::Ptr<emp::Random> rnd=nullptr)
+    : emp::EventDrivenGP(_ilib, _elib, rnd) { }
   const program_t & GetGenome() { return GetProgram(); }
 };
 
@@ -65,6 +67,7 @@ protected:
   static constexpr size_t TRAIT_ID__LAST_EXPORT = 4;  ///< Used to determine most recent export (-1 if nothing exported).
   static constexpr size_t TRAIT_ID__MSG_DIR = 5;      ///< Used to determine direction of message dispatch.
   static constexpr size_t TRAIT_ID__RES_MOD = 6;      ///< Used to determine how many resources should be gained from an export.
+  static constexpr size_t TRAIT_ID__EXPORTED = 7;     ///< Used to determine if program has exported on a single advance. (used to limit number of times program exports per advance)
 
   static constexpr size_t NUM_NEIGHBORS = 4;
   static constexpr size_t NUM_ENV_STATES = 3;
@@ -120,7 +123,7 @@ protected:
   emp::Ptr<world_t> world;
 
   emp::vector<size_t> schedule;
-  emp::vector<bool> scheduled;
+  emp::vector<char> scheduled;
 
 public:
   PABB_Ancestral(int argc, char* argv[], const std::string & _config_fname)
@@ -177,7 +180,7 @@ public:
     env_states.resize(GRID_SIZE);
 
     // Setup schedule management
-    scheduled.resize(GRID_SIZE, false);
+    scheduled.resize(GRID_SIZE, 0);
 
     // Setup instruction set.
     inst_lib = emp::NewPtr<inst_lib_t>();
@@ -209,7 +212,7 @@ public:
     inst_lib->AddInst("Pull", hardware_t::Inst_Pull, 2, "Shared memory Arg1 => Shared memory Arg2.");
     inst_lib->AddInst("Nop", hardware_t::Inst_Nop, 0, "No operation.");
     // Custom instructions:
-    inst_lib->AddInst("Random", Inst_Random, 2, "Local memory: Arg2 => RandomUInt([0:(size_t)Arg1))");
+    inst_lib->AddInst("RandomDir", Inst_RandomDir, 1, "Local memory: Arg1 => RandomUInt([0:4)");
     inst_lib->AddInst("Repro", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Repro(hw, inst); }, 0, "Triggers reproduction if able.");
     inst_lib->AddInst("ReproRdy", [this](hardware_t & hw, const inst_t & inst) { this->Inst_ReproRdy(hw, inst); }, 1, "Local memory Arg1 => Ready to repro?");
     inst_lib->AddInst("Export0", [this](hardware_t & hw, const inst_t & inst) { this->Inst_Export0(hw, inst); }, 0, "Export product ID 0.");
@@ -248,12 +251,13 @@ public:
     prog.PushInst("ReproRdy", 0);
     prog.PushInst("If", 0);
     prog.PushInst("SetMem", 0, 4);
-    prog.PushInst("Random", 0, 1);
+    prog.PushInst("RandomDir", 0, 1);
     prog.PushInst("RotDir", 1);
     prog.PushInst("Repro");
     prog.PushInst("Close");
 
-    EventDrivenOrg ancestor;
+    EventDrivenOrg ancestor(inst_lib, event_lib, random);
+    // EventDrivenOrg ancestor;
     ancestor.SetProgram(prog);
     ancestor.SetMinBindThresh(HW_MIN_BIND_THRESH);
     ancestor.SetMaxCores(HW_MAX_CORES);
@@ -316,6 +320,8 @@ public:
 
   void DoExport(size_t id, size_t val) {
     hardware_t & hw = world->GetOrg(id);
+    // Has organism already exported this update?
+    if (hw.GetTrait(TRAIT_ID__EXPORTED)) return;
     hw.SetTrait(TRAIT_ID__LAST_EXPORT, val);
     double mod = hw.GetTrait(TRAIT_ID__RES_MOD);
     if (val == env_states[id]) {
@@ -334,10 +340,7 @@ public:
 
   // DoRepro(source->dest)
   void DoReproduction(size_t src_id, size_t dest_id) {
-    std::cout << "Do reproduction: {src_id: " << src_id << ", dest_id: " << dest_id << "}" << std::endl;
-    world->DoBirthAt(world->GetOrg(src_id), dest_id, src_id); // NOTE: This seems exceedingly slow for things like virtual hardware.
-    ResetOrg(src_id); // Reset parent organism.
-    // TODO: Make sure offspring is all good: mutated, and hardware looks same.
+    //////////////////////////////////
     // Reproduction flow:
     //    - DoReproduction() <-- trigger reproduction.
     //      - DoBirthAt()
@@ -346,6 +349,10 @@ public:
     //      - Mutations
     //    - Org Placement
     //      - Reset placed org (offspring)
+    //////////////////////////////////
+    // NOTE: This seems exceedingly slow for things like virtual hardware.
+    world->DoBirthAt(world->GetOrg(src_id), dest_id, src_id);
+    ResetOrg(src_id); // Reset parent organism.
   }
 
   void ResetOrg(size_t id) {
@@ -360,12 +367,13 @@ public:
     org.SetTrait(TRAIT_ID__LAST_EXPORT, -1);
     org.SetTrait(TRAIT_ID__MSG_DIR, -1);
     org.SetTrait(TRAIT_ID__RES_MOD, 1);
+    org.SetTrait(TRAIT_ID__EXPORTED, 0);
   }
 
   void Schedule(size_t id) {
     if (scheduled[id]) return;
     schedule.emplace_back(id);
-    scheduled[id] = true;
+    scheduled[id] = 1;
   }
 
   /// Mutate organism function.
@@ -453,43 +461,53 @@ public:
   void Run() {
     // Run Evolution.
     for (size_t ud = 0; ud < UPDATES; ++ud) {
-      std::cout << "===============================" << std::endl;
-      std::cout << "Update: " << ud << std::endl;
-
+      std::cout << "Update: " << ud <<  "  Pop size: " << schedule.size() << std::endl;
       // Randomize schedule.
       Shuffle(*random, schedule);
-
       // Give out CPU cycles to everyone on the schedule.
       // Note: Loop structure relies on overflowing size_t i. When hits -1, will be max size_t.
       for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
         size_t id = schedule[i];
-        std::cout << "----------------------" << std::endl;
-        std::cout << "  Running... " << id << std::endl;
-        world->GetOrg(id).IncTrait(TRAIT_ID__RES);  // Give out resources.
-        world->GetOrg(id).PrintState();
-        //world->GetOrg(id).SetTrait(TRAIT_ID__RES, )
+        // std::cout << "  go" << std::endl;
+        org_t & org = world->GetOrg(id);
+        // std::cout << "  traits" << std::endl;
+        org.SetTrait(TRAIT_ID__EXPORTED, 0);
+        org.IncTrait(TRAIT_ID__RES);  // Give out resources.
+
+        if (ud == 3155) {
+          org.PrintState();
+          org.PrintProgram();
+        }
+
+        // std::cout << "  pid" << std::endl;
         world->ProcessID(id, 1); // Call Process(num_inst = 1)
+        // std::cout << "  dpid" << std::endl;
       }
-      std::cout << "Press anything to continue..." << std::endl;
-      std::string x;
-      std::cin >> x;
+      // std::cout << "Press anything to continue..." << std::endl;
+      // std::string x;
+      // std::cin >> x;
+    }
+
+    for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
+      size_t id = schedule[i];
+      std::cout << "-------------------------------------------------------" << std::endl;
+      std::cout << "Printing... " << id << std::endl;
+      org_t & org = world->GetOrg(id);
+      org.PrintState();
+      std::cout << "          ~~~~~~~~~~~          " << std::endl;
+      org.PrintProgram();
     }
   }
 
   // ============== World signal handlers: ==============
   void OnOrgPlacement(size_t id) {
-    std::cout << "OnOrgPlacement!" << std::endl;
     // Configure placed organism.
-    Loc pos = GetPos(id);
-    org_t & org = world->GetOrg(id);
-    std::cout << "Org being placed: " << id << "(" << pos.x << ", " << pos.y << ")"<< std::endl;
     ResetOrg(id);
     Schedule(id); // Add to schedule.
-    org.PrintState();
+
   }
 
   void OnOffspringReady(org_t & hw) {
-    std::cout << "On offspring ready!" << std::endl;
     // Mutate offspring.
     world->DoMutationsOrg(hw);
   }
@@ -507,17 +525,22 @@ public:
       // Who is the recipient?
       const Loc pos = GetFacing(sender_x, sender_y, dir);
       // Queue up the message.
-      world->GetOrg(GetID(pos.x, pos.y)).QueueEvent(event);
+      const size_t rID = GetID(pos.x, pos.y);
+      if (world->IsOccupied(rID)) world->GetOrg(rID).QueueEvent(event);
     } else {
       const Loc u_pos = GetFacing(sender_x, sender_y, DIR_UP);
       const Loc d_pos = GetFacing(sender_x, sender_y, DIR_DOWN);
       const Loc r_pos = GetFacing(sender_x, sender_y, DIR_RIGHT);
       const Loc l_pos = GetFacing(sender_x, sender_y, DIR_LEFT);
       // Queue up messages.
-      world->GetOrg(GetID(u_pos.x, u_pos.y)).QueueEvent(event);
-      world->GetOrg(GetID(d_pos.x, d_pos.y)).QueueEvent(event);
-      world->GetOrg(GetID(r_pos.x, r_pos.y)).QueueEvent(event);
-      world->GetOrg(GetID(l_pos.x, l_pos.y)).QueueEvent(event);
+      const size_t rID0 = GetID(u_pos.x, u_pos.y);
+      const size_t rID1 = GetID(d_pos.x, d_pos.y);
+      const size_t rID2 = GetID(r_pos.x, r_pos.y);
+      const size_t rID3 = GetID(l_pos.x, l_pos.y);
+      if (world->IsOccupied(rID0)) world->GetOrg(rID0).QueueEvent(event);
+      if (world->IsOccupied(rID1)) world->GetOrg(rID1).QueueEvent(event);
+      if (world->IsOccupied(rID2)) world->GetOrg(rID2).QueueEvent(event);
+      if (world->IsOccupied(rID3)) world->GetOrg(rID3).QueueEvent(event);
     }
   }
 
@@ -546,11 +569,11 @@ public:
     }
   }
 
-  /// Instruction: Random
-  /// Description: Local[Arg2] = RandomInt(0, Local[Arg1])
-  static void Inst_Random(emp::EventDrivenGP & hw, const inst_t & inst) {
+  /// Instruction: RandomDir
+  /// Description: Local[Arg1] = RandomInt(0, NUM_DIRECTIONS)
+  static void Inst_RandomDir(emp::EventDrivenGP & hw, const inst_t & inst) {
     state_t & state = hw.GetCurState();
-    state.SetLocal(inst.args[1], hw.GetRandom().GetUInt(0, (uint32_t)state.AccessLocal(inst.args[0])));
+    state.SetLocal(inst.args[0], hw.GetRandom().GetUInt(0, NUM_NEIGHBORS));
   }
 
   /// Instruction: Export0
