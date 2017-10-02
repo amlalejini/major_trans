@@ -1,18 +1,14 @@
 // TODO:
-//  [ ] Setup events.
-//  [ ] Add default event handler to EventDrivenGP
 //  [ ] Save time by giving each hardware_t world_id trait.
-//
-// Ancestral Program:
-//  fn-0 00000000:
-//    Nop
-//    Nop
-//    ...
+
 
 
 #include <string>
 #include <functional>
 #include <utility>
+#include <deque>
+#include <fstream>
+#include <sys/stat.h>
 
 #include "base/Ptr.h"
 #include "base/vector.h"
@@ -21,6 +17,7 @@
 #include "tools/random_utils.h"
 #include "tools/BitSet.h"
 #include "tools/Math.h"
+#include "tools/string_utils.h"
 #include "hardware/EventDrivenGP.h"
 #include "Evo/World.h"
 
@@ -58,6 +55,12 @@ public:
     Loc(size_t _x = 0, size_t _y = 0) : x(_x), y(_y) { ; }
   };
 
+  struct Birth {
+    size_t src_id;
+    size_t dest_id;
+    Birth(size_t _src_id, size_t _dest_id) : src_id(_src_id), dest_id(_dest_id) { ; }
+  };
+
 protected:
   // Constant variables:
   static constexpr size_t TRAIT_ID__X_LOC = 0;        ///< Agent's Y location.
@@ -68,6 +71,7 @@ protected:
   static constexpr size_t TRAIT_ID__MSG_DIR = 5;      ///< Used to determine direction of message dispatch.
   static constexpr size_t TRAIT_ID__RES_MOD = 6;      ///< Used to determine how many resources should be gained from an export.
   static constexpr size_t TRAIT_ID__EXPORTED = 7;     ///< Used to determine if program has exported on a single advance. (used to limit number of times program exports per advance)
+  static constexpr size_t TRAIT_ID__REPRODUCED = 8;   ///< Used to determine if program has reproduced on this update.
 
   static constexpr size_t NUM_NEIGHBORS = 4;
   static constexpr size_t NUM_ENV_STATES = 3;
@@ -84,6 +88,7 @@ protected:
   size_t GRID_HEIGHT;
   size_t GRID_SIZE;
   size_t UPDATES;
+  std::string ANCESTOR_FPATH;
 
   // Resources & reproduction.
   double COST_OF_REPRO;
@@ -110,6 +115,11 @@ protected:
   double PER_FUNC__FUNC_DUP_RATE;
   double PER_FUNC__FUNC_DEL_RATE;
 
+  // Output info.
+  size_t SYSTEMATICS_INTERVAL;
+  size_t POP_SNAPSHOT_INTERVAL;
+  std::string DATA_DIR;
+
   MajorTransConfig config;
   emp::Ptr<emp::Random> random;
   emp::vector<affinity_t> affinity_table;   // A convenient affinity lookup table (int->bitset).
@@ -125,9 +135,12 @@ protected:
   emp::vector<size_t> schedule;
   emp::vector<char> scheduled;
 
+  std::deque<Birth> birth_queue;
+
 public:
   PABB_Ancestral(int argc, char* argv[], const std::string & _config_fname)
     : RAND_SEED(0), GRID_WIDTH(0), GRID_HEIGHT(0), GRID_SIZE(0), UPDATES(0),
+      ANCESTOR_FPATH(),
       config(), random(), affinity_table(256), env_state_affs(), env_states(),
       inst_lib(), event_lib(), world(), schedule(), scheduled() {
 
@@ -149,6 +162,7 @@ public:
     GRID_HEIGHT = config.GRID_HEIGHT();
     GRID_SIZE = GRID_WIDTH * GRID_HEIGHT;
     UPDATES = config.UPDATES();
+    ANCESTOR_FPATH = config.ANCESTOR_FILE();
     MAX_MOD = config.MAX_MOD();
     MIN_MOD = config.MIN_MOD();
     RES_PER_UPDATE = config.RESOURCES_PER_UPDATE();
@@ -166,6 +180,13 @@ public:
     PER_FUNC__SLIP_RATE = config.PER_FUNC__SLIP_RATE();
     PER_FUNC__FUNC_DUP_RATE = config.PER_FUNC__FUNC_DUP_RATE();
     PER_FUNC__FUNC_DEL_RATE = config.PER_FUNC__FUNC_DEL_RATE();
+    SYSTEMATICS_INTERVAL = config.SYSTEMATICS_INTERVAL();
+    POP_SNAPSHOT_INTERVAL = config.POP_SNAPSHOT_INTERVAL();
+    DATA_DIR = config.DATA_DIRECTORY();
+
+    // Setup output directory.
+    mkdir(DATA_DIR.c_str(), ACCESSPERMS);
+    if (DATA_DIR.back() != '/') DATA_DIR += '/';
 
     // Create random number generator.
     random = emp::NewPtr<emp::Random>(RAND_SEED);
@@ -238,27 +259,22 @@ public:
     world->SetMutFun([this](org_t & hw, emp::Random & rnd) { return this->Mutate(hw, rnd); });
     world->OnOrgPlacement([this](size_t id) { this->OnOrgPlacement(id); });
     world->OnOffspringReady([this](org_t & hw) { this->OnOffspringReady(hw); });
+    world->OnUpdate([this](size_t update) { this->OnUpdate(update); });
 
+    auto & sys_file = world->SetupSystematicsFile(DATA_DIR + "systematics.csv");
+    sys_file.SetTimingRepeat(SYSTEMATICS_INTERVAL);
     // Setup the environment (randomize).
     for (size_t i = 0; i < env_states.size(); ++i)
       env_states[i] = (size_t)random->GetUInt(0, NUM_ENV_STATES);
 
     // Initialize the population with single ancestor.
-    // TODO: read ancestor from file
-    program_t prog(inst_lib);
-    prog.PushFunction(function_t(affinity_table[0]));
-    for (size_t i = 0; i < 9; ++i) prog.PushInst("Nop");
-    prog.PushInst("ReproRdy", 0);
-    prog.PushInst("If", 0);
-    prog.PushInst("SetMem", 0, 4);
-    prog.PushInst("RandomDir", 0, 1);
-    prog.PushInst("RotDir", 1);
-    prog.PushInst("Repro");
-    prog.PushInst("Close");
-
+    std::ifstream ancestor_fstream(ANCESTOR_FPATH);
+    if (!ancestor_fstream.is_open()) {
+      std::cout << "Failed to open ancestor program file. Exiting..." << std::endl;
+      exit(-1);
+    }
     EventDrivenOrg ancestor(inst_lib, event_lib, random);
-    // EventDrivenOrg ancestor;
-    ancestor.SetProgram(prog);
+    ancestor.Load(ancestor_fstream);
     ancestor.SetMinBindThresh(HW_MIN_BIND_THRESH);
     ancestor.SetMaxCores(HW_MAX_CORES);
     ancestor.SetMaxCallDepth(HW_MAX_CALL_DEPTH);
@@ -338,21 +354,13 @@ public:
     env_states[id] = random->GetUInt(NUM_ENV_STATES);
   }
 
-  // DoRepro(source->dest)
   void DoReproduction(size_t src_id, size_t dest_id) {
-    //////////////////////////////////
-    // Reproduction flow:
-    //    - DoReproduction() <-- trigger reproduction.
-    //      - DoBirthAt()
-    //      - Reset parent here.
-    //    - Offspring ready
-    //      - Mutations
-    //    - Org Placement
-    //      - Reset placed org (offspring)
-    //////////////////////////////////
-    // NOTE: This seems exceedingly slow for things like virtual hardware.
-    world->DoBirthAt(world->GetOrg(src_id), dest_id, src_id);
-    ResetOrg(src_id); // Reset parent organism.
+    org_t & src_org = world->GetOrg(src_id);
+    // Has source already reproduced?
+    if (src_org.GetTrait(TRAIT_ID__REPRODUCED)) return;
+    src_org.SetTrait(TRAIT_ID__REPRODUCED, 1);
+    // Schedule reproduction.
+    birth_queue.emplace_back(src_id, dest_id);
   }
 
   void ResetOrg(size_t id) {
@@ -368,6 +376,7 @@ public:
     org.SetTrait(TRAIT_ID__MSG_DIR, -1);
     org.SetTrait(TRAIT_ID__RES_MOD, 1);
     org.SetTrait(TRAIT_ID__EXPORTED, 0);
+    org.SetTrait(TRAIT_ID__REPRODUCED, 0);
   }
 
   void Schedule(size_t id) {
@@ -458,44 +467,62 @@ public:
   }
 
   // ============== Running the experiment. ==============
+  void OnUpdate(size_t update) {
+    std::cout << "Update: " << update <<  "  Pop size: " << schedule.size() << "  Ave depth: " << world->GetSystematics().GetAveDepth() << std::endl;
+    // Randomize schedule.
+    Shuffle(*random, schedule);
+    // Give out CPU cycles to everyone on the schedule.
+    // Note: Loop structure relies on overflowing size_t i. When hits -1, will be max size_t.
+    for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
+      size_t id = schedule[i];
+      org_t & org = world->GetOrg(id);
+      org.SetTrait(TRAIT_ID__EXPORTED, 0);
+      org.SetTrait(TRAIT_ID__REPRODUCED, 0);
+      org.IncTrait(TRAIT_ID__RES);  // Give out resources.
+      world->ProcessID(id, 1); // Call Process(num_inst = 1)
+    }
+    // Process birth queue.
+    while (!birth_queue.empty()) {
+      Birth & birth = birth_queue.front(); // Who's next?
+      world->DoBirthAt(world->GetOrg(birth.src_id), birth.dest_id, birth.src_id); // Do birth!
+      ResetOrg(birth.src_id);
+      birth_queue.pop_front();
+    }
+    // std::cout << "Press anything to continue..." << std::endl;
+    // std::string x;
+    // std::cin >> x;
+  }
+
+  void Snapshot(size_t update) {
+    std::string snapshot_dir = DATA_DIR + "/pop_" + emp::to_string((int)update);
+    std::string prog_filename;
+    mkdir(snapshot_dir.c_str(), ACCESSPERMS);
+    // For each individual in the population, dump full program description.
+    for (size_t i = 0; i < world->GetSize(); ++i) {
+      if (!scheduled[i]) continue;
+      org_t & org = world->GetOrg(i);
+      std::ofstream prog_ofstream(snapshot_dir + "/prog_" + emp::to_string((int)i) + ".gp");
+      org.PrintProgramFull(prog_ofstream);
+      prog_ofstream.close();
+    }
+  }
+
   void Run() {
     // Run Evolution.
     for (size_t ud = 0; ud < UPDATES; ++ud) {
-      std::cout << "Update: " << ud <<  "  Pop size: " << schedule.size() << std::endl;
-      // Randomize schedule.
-      Shuffle(*random, schedule);
-      // Give out CPU cycles to everyone on the schedule.
-      // Note: Loop structure relies on overflowing size_t i. When hits -1, will be max size_t.
-      for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
-        size_t id = schedule[i];
-        // std::cout << "  go" << std::endl;
-        org_t & org = world->GetOrg(id);
-        // std::cout << "  traits" << std::endl;
-        org.SetTrait(TRAIT_ID__EXPORTED, 0);
-        org.IncTrait(TRAIT_ID__RES);  // Give out resources.
-
-        if (ud == 3155) {
-          org.PrintState();
-          org.PrintProgram();
-        }
-
-        // std::cout << "  pid" << std::endl;
-        world->ProcessID(id, 1); // Call Process(num_inst = 1)
-        // std::cout << "  dpid" << std::endl;
-      }
-      // std::cout << "Press anything to continue..." << std::endl;
-      // std::string x;
-      // std::cin >> x;
+      world->Update();
+      if (ud % POP_SNAPSHOT_INTERVAL == 0) Snapshot(ud);
     }
-
+    // Print everything out.
     for (size_t i = schedule.size() - 1; i < schedule.size(); --i) {
       size_t id = schedule[i];
       std::cout << "-------------------------------------------------------" << std::endl;
       std::cout << "Printing... " << id << std::endl;
+      std::cout << " " << "{id: " << schedule[i] << ", mc: " << world->GetOrg(schedule[i]).GetMaxCores() << "}" << std::endl;
       org_t & org = world->GetOrg(id);
       org.PrintState();
       std::cout << "          ~~~~~~~~~~~          " << std::endl;
-      org.PrintProgram();
+      org.PrintProgramFull();
     }
   }
 
@@ -504,7 +531,6 @@ public:
     // Configure placed organism.
     ResetOrg(id);
     Schedule(id); // Add to schedule.
-
   }
 
   void OnOffspringReady(org_t & hw) {
@@ -563,6 +589,7 @@ public:
       const size_t y = (size_t)hw.GetTrait(TRAIT_ID__Y_LOC);
       const size_t dir = (size_t)hw.GetTrait(TRAIT_ID__DIR);
       const Loc offspring_pos = GetFacing(x, y, dir);
+      hw.DecTrait(TRAIT_ID__RES, COST_OF_REPRO);
       DoReproduction(GetID(x, y), GetID(offspring_pos.x, offspring_pos.y));
     } else { // Otherwise, pay cost of failure.
       hw.SetTrait(TRAIT_ID__RES, res - FAILED_REPRO_PENALTY);

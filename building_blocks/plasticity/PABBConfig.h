@@ -8,6 +8,7 @@ EMP_BUILD_CONFIG( MajorTransConfig,
   VALUE(DEBUG_MODE, bool, false, "Should we output debug information?"),
   VALUE(RANDOM_SEED, int, 2, "Random number seed (0 for based on time)"),
   VALUE(UPDATES, size_t, 100, "Number of generations to run."),
+  VALUE(ANCESTOR_FILE, std::string, "ancestor.gp", "File to read for ancestor program."),
   GROUP(ENVIRONMENT_GROUP, "Environment Settings"),
   VALUE(GRID_WIDTH, size_t, 60, "Width of population grid."),
   VALUE(GRID_HEIGHT, size_t, 60, "Height of population grid."),
@@ -27,7 +28,10 @@ EMP_BUILD_CONFIG( MajorTransConfig,
   VALUE(PER_INST__SUB_RATE, double, 0.005, "."),
   VALUE(PER_FUNC__SLIP_RATE, double, 0.05, "."),
   VALUE(PER_FUNC__FUNC_DUP_RATE, double, 0.05, "."),
-  VALUE(PER_FUNC__FUNC_DEL_RATE, double, 0.05, ".")
+  VALUE(PER_FUNC__FUNC_DEL_RATE, double, 0.05, "."),
+  VALUE(SYSTEMATICS_INTERVAL, size_t, 100, "."),
+  VALUE(POP_SNAPSHOT_INTERVAL, size_t, 100000, "."),
+  VALUE(DATA_DIRECTORY, std::string, "./", ".")
 )
 
 #endif
